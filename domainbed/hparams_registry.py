@@ -32,11 +32,14 @@ def _hparams(algorithm, dataset, random_seed):
     _hparam('resnet18', False, lambda r: False)
     _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
     _hparam('class_balanced', False, lambda r: False)
+    _hparam('vit', False, lambda r: False)
+    _hparam('vit_attn_tune', False, lambda r: False)
     # TODO: nonlinear classifiers disabled
     _hparam('nonlinear_classifier', False,
             lambda r: bool(r.choice([False, False])))
     hparams["optimizer"] = ("adam", "adam")
-
+    _hparam('vit_finetune', True, lambda r: True)
+    _hparam('vit_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
     hparams["val_augment"] = (False, False)  # augmentation for in-domain validation set
     hparams["freeze_bn"] = (True, True)
     hparams["pretrained"] = (True, True)  # only for ResNet
