@@ -202,13 +202,13 @@ if __name__ == "__main__":
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
-
+    train_loss_logs = collections.defaultdict(list)  # store any numeric loss separately
+    train_steps = []
     steps_per_epoch = min([len(env) / hparams['batch_size'] for env, _ in in_splits])
 
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
-
-
+    # print(f">>> [DEBUG] Steps per epoch: {steps_per_epoch}, Total steps: {n_steps}")
     def save_checkpoint(filename):
         if args.skip_model_save:
             return
@@ -224,64 +224,165 @@ if __name__ == "__main__":
 
 
     last_results_keys = None
+
     for step in range(start_step, n_steps):
+        print(f"\n>>> [DEBUG] ===== Step {step+1}/{n_steps} =====")
+        print(f">>> [DEBUG] GPU Memory before step: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+
         step_start_time = time.time()
-        minibatches_device = [(x.to(device), y.to(device)) for x, y in next(train_minibatches_iterator)]
+
+        # ---- Load minibatches ----
+        try:
+            minibatches_device = [(x.to(device), y.to(device))
+                                  for x, y in next(train_minibatches_iterator)]
+        except Exception as e:
+            print(f">>> [ERROR] Failed to load minibatch: {e}")
+            break
+
+        # ---- Handle UDA minibatch ----
         if args.task == "domain_adaptation":
-            uda_device = [x.to(device) for x, _ in next(uda_minibatches_iterator)]
+            try:
+                uda_device = [x.to(device) for x, _ in next(uda_minibatches_iterator)]
+                print(">>> [DEBUG] UDA minibatch loaded.")
+            except StopIteration:
+                print(">>> [WARN] No UDA minibatch available.")
+                uda_device = None
         else:
             uda_device = None
-        step_vals = algorithm.update(minibatches_device)
-        checkpoint_vals['step_time'].append(time.time() - step_start_time)
 
+        # ---- Algorithm update ----
+        try:
+            step_vals = algorithm.update(minibatches_device, uda_device)
+        except Exception as e:
+            print(f">>> [ERROR] Algorithm update failed: {e}")
+            break
+
+        checkpoint_vals['step_time'].append(time.time() - step_start_time)
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
 
-        if (step % checkpoint_freq == 0) or (step == n_steps - 1):
-            results = {
-                'step': step,
-                'epoch': step / steps_per_epoch,
-            }
+                # store loss for curve
+        numeric_vals = {k: v for k, v in step_vals.items() if isinstance(v, (int, float))}
+        if len(numeric_vals) > 0:
+            train_steps.append(step)
+            for k, v in numeric_vals.items():
+                # store all numeric metrics/losses
+                train_loss_logs[k].append(v)
 
+        # ---- Checkpointing & Evaluation every 100 steps ----
+        if (step > 0 and step % 1000 == 0) or (step == n_steps - 1):
+            print(f">>> [DEBUG] Running evaluation at step {step}...")
+
+            results = {'step': step, 'epoch': step / steps_per_epoch}
             for key, val in checkpoint_vals.items():
                 results[key] = np.mean(val)
 
+            # ---- Evaluate on all environments ----
             evals = zip(eval_loader_names, eval_loaders, eval_weights)
             for name, loader, weights in evals:
                 acc = misc.accuracy(algorithm, loader, weights, device)
-                results[name + '_acc'] = acc
+                results[name+'_acc'] = acc
 
-            results['algorithm'] = args.algorithm
-            results['dataset'] = args.dataset
-            results['test_envs'] = args.test_envs
-            results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024. * 1024. * 1024.)
+            # ---- Log memory usage ----
+            results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
+            print(f">>> [DEBUG] GPU Memory after evaluation: {results['mem_gb']:.2f} GB")
 
+            # ---- Print results table ----
             results_keys = sorted(results.keys())
             if results_keys != last_results_keys:
                 misc.print_row(results_keys, colwidth=12)
                 last_results_keys = results_keys
-            misc.print_row([results[key] for key in results_keys],
-                           colwidth=12)
+            misc.print_row([results[key] for key in results_keys], colwidth=12)
 
-            # if wandb.run:
-            #     wandb.log(results)
-            results.update({
-                'hparams': hparams,
-                'args': vars(args)
-            })
-
+            # ---- Save results ----
+            results.update({'hparams': hparams, 'args': vars(args)})
             epochs_path = os.path.join(args.output_dir, 'results.jsonl')
             with open(epochs_path, 'a') as f:
                 f.write(json.dumps(results, sort_keys=True) + "\n")
 
+            # ---- Save checkpoint every 1000 steps ----
             algorithm_dict = algorithm.state_dict()
             start_step = step + 1
             checkpoint_vals = collections.defaultdict(lambda: [])
-
-            if args.save_model_every_checkpoint:
+            if (step % 1000 == 0 and step > 0 ) or args.save_model_every_checkpoint or (step == n_steps - 1):
                 save_checkpoint(f'model_step{step}.pkl')
+                print(f">>> [DEBUG] Checkpoint model_step{step}.pkl saved.")
 
+    # ---- Final checkpoint ----
     save_checkpoint('model.pkl')
+    print(">>> [DEBUG] Final model checkpoint saved.")
+
+# ---- Plot final training loss curve ----
+    # ---- Plot all tracked losses ----
+    if len(train_loss_logs) > 0:
+        plt.figure(figsize=(8, 5))
+        for loss_name, loss_values in train_loss_logs.items():
+            plt.plot(train_steps, loss_values, label=loss_name)
+        plt.xlabel("Step")
+        plt.ylabel("Loss Value")
+        plt.title("Training Loss Curves")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.output_dir, "training_loss_curves.png"))
+        plt.close()
+        print(f">>> [DEBUG] Training loss curves saved to {os.path.join(args.output_dir, 'training_loss_curves.png')}")
+
+        # ---- Plot test env accuracy bar chart ----
+    
+        # ---- Plot test env accuracy bar chart from results.jsonl ----
+    results_path = os.path.join(args.output_dir, "results.jsonl")
+    plots_dir = os.path.join(args.output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    test_env = args.test_envs[0]
+    acc_key = f"env{test_env}_out_acc"
+
+    if os.path.exists(results_path):
+        steps = []
+        accs = []
+
+        with open(results_path, "r") as f:
+            for line in f:
+                try:
+                    record = json.loads(line.strip())
+                    if acc_key in record and "step" in record:
+                        steps.append(record["step"])
+                        accs.append(record[acc_key])
+                except json.JSONDecodeError:
+                    continue
+
+        if len(steps) > 0:
+            plt.figure(figsize=(10, 6))
+            if len(steps) > 1:
+                step_gap = steps[1] - steps[0]
+                bar_width = step_gap * 0.6   # 60% of the distance between steps
+            else:
+                bar_width = 50
+
+            bars = plt.bar(steps, [a * 100 for a in accs], width=bar_width, align='center')
+
+            plt.title(f'Test Env {test_env} Out Accuracy over Steps')
+            plt.xlabel('Training Step')
+            plt.ylabel('Accuracy (%)')
+            plt.grid(axis='y')
+
+            # Add percentage labels above bars
+            for bar, acc in zip(bars, accs):
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width() / 2, height + 0.5,
+                         f"{acc * 100:.2f}%", ha='center', va='bottom', fontsize=8)
+
+            bar_path = os.path.join(plots_dir, f'env{test_env}_out_acc_bar.png')
+            plt.tight_layout()
+            plt.savefig(bar_path)
+            plt.close()
+            print(f">>> [DEBUG] Saved test env out accuracy bar chart: {bar_path}")
+        else:
+            print(f">>> [DEBUG] No valid accuracy entries found in {results_path}")
+    else:
+        print(f">>> [DEBUG] results.jsonl not found at {results_path}, skipping accuracy plot.")
 
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')
+    print(">>> [DEBUG] Training completed successfully.")
