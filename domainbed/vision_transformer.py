@@ -22,6 +22,8 @@ for some einops/einsum fun
 
 Hacked together by / Copyright 2020, Ross Wightman
 """
+import timm
+# timm.models.registry._MODEL_ENTRYPOINTS.clear()
 import logging
 import math
 from collections import OrderedDict
@@ -37,7 +39,7 @@ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCE
 
 sys.path.append(f"{os.getenv('DOMAINBED_PROJECT_DIR')}/domainbed")
 
-from vit_helpers import build_model_with_cfg, named_apply, adapt_input_conv
+from domainbed.vit_helpers import build_model_with_cfg, named_apply, adapt_input_conv
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
 
@@ -248,7 +250,7 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.cur_layer = moe_layers[cur_depth] if moe_layers is not None else 'F'
         self.moe_drop = nn.Dropout(0.1)
-        self.is_tutel = is_tutel
+        # self.is_tutel = is_tutel
         self.aux_loss_weights = 0.01
         if self.cur_layer == 'S':
             # print(f'cur_layer {cur_depth} is sparse with {num_experts} experts with BPR True')
@@ -335,7 +337,7 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, index_hook=index_hook, router=router)
+                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, router=router)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
