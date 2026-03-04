@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torchvision.models
 import clip
-
+import timm
 
 def clip_imageencoder(name):
     model, _preprocess = clip.load(name, device="cpu")
@@ -90,14 +90,21 @@ def get_backbone(name, preserve_readout, pretrained):
             nn.Flatten(1),
         )
         n_outputs = 3024
+    elif name == "vit_small_patch16_224":
+        network = timm.create_model(
+            "vit_small_patch16_224",
+            pretrained=pretrained
+        )
+        n_outputs = network.num_features
     else:
         raise ValueError(name)
 
     if not preserve_readout:
-        # remove readout layer (but left GAP and flatten)
-        # final output shape: [B, n_outputs]
-        if name.startswith("resnet"):
-            del network.fc
-            network.fc = Identity()
+      if name.startswith("resnet"):
+          del network.fc
+          network.fc = Identity()
+      elif name.startswith("vit"):
+          network.head = Identity()
 
     return network, n_outputs
+
