@@ -16,7 +16,8 @@ from copy import deepcopy
 import copy
 
 sys.path.append('/mnt/lustre/bli/projects/EIL/domainbed')
-import vision_transformer, vision_transformer_hybrid
+from . import vision_transformer
+# from . import vision_transformer_hybrid
 from collections import defaultdict, OrderedDict
 
 try:
@@ -26,7 +27,7 @@ except:
     backpack = None
 
 from domainbed import networks
-from domainbed import resnet_variants
+# from domainbed import resnet_variants
 import torchvision.models as models
 
 ALGORITHMS = [
@@ -192,7 +193,7 @@ class GMOE(Algorithm):
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(GMOE, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=6, is_tutel=True, drop_path_rate=0.1, router='cosine_top').cuda()
+        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=6, drop_path_rate=0.1, router='cosine_top').cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
 
     def update(self, minibatches, unlabeled=None):
