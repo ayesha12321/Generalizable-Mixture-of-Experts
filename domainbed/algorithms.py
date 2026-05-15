@@ -57,7 +57,8 @@ ALGORITHMS = [
     'IB_IRM',
     'CAD',
     'CondCAD',
-    'GMOE'
+    'GMOE',
+    'NullExpertMoE'
 ]
 
 
@@ -193,7 +194,18 @@ class GMOE(Algorithm):
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(GMOE, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=6, drop_path_rate=0.1, router='cosine_top').cuda()
+        num_experts = int(self.hparams.get('gmoe_num_experts', 6))
+        top_k = int(self.hparams.get('gmoe_top_k', 1))
+        self.model = vision_transformer.deit_small_patch16_224(
+            pretrained=True,
+            num_classes=num_classes,
+            moe_layers=['F'] * 8 + ['S', 'F'] * 2,
+            mlp_ratio=4.,
+            num_experts=num_experts,
+            moe_top_k=top_k,
+            drop_path_rate=0.1,
+            router='cosine_top'
+        ).cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
 
     def update(self, minibatches, unlabeled=None):
@@ -205,9 +217,9 @@ class GMOE(Algorithm):
             if getattr(block, 'aux_loss') is not None:
                 loss_aux_list.append(block.aux_loss)
 
-        loss_aux = 0
-        for layer_loss in loss_aux_list:
-            loss_aux += layer_loss
+        loss_aux = torch.tensor(0.0, device=all_x.device)
+        if len(loss_aux_list):
+            loss_aux = torch.stack(loss_aux_list).sum()
 
         loss += loss_aux
         self.optimizer.zero_grad()
@@ -225,6 +237,255 @@ class GMOE(Algorithm):
                 return (prediction[0] + prediction[1]) / 2
             else:
                 return prediction
+
+
+class NullExpertMoE(Algorithm):
+    """ViT GMoE with one additional null expert and anti-collapse controls."""
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(NullExpertMoE, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.num_domains = num_domains
+        self.num_real_experts = int(self.hparams.get('gmoe_num_experts', 6))
+        self.num_total_experts = self.num_real_experts + 1
+
+        self.model = vision_transformer.deit_small_patch16_224(
+            pretrained=True,
+            num_classes=num_classes,
+            moe_layers=['F'] * 8 + ['S', 'F'] * 2,
+            mlp_ratio=4.,
+            num_experts=self.num_real_experts,
+            moe_top_k=int(self.hparams.get('gmoe_top_k', 2)),
+            use_null_moe=True,
+            num_domains=num_domains,
+            moe_temperature=float(self.hparams.get('null_moe_temperature', 0.1)),
+            drop_path_rate=0.1,
+            router='cosine_top'
+        ).cuda()
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        self.register_buffer('update_count', torch.tensor([0]))
+
+    @staticmethod
+    def _stack_mean_or_zero(losses, device):
+        if len(losses) == 0:
+            return torch.tensor(0.0, device=device)
+        return torch.stack(losses).mean()
+
+    @staticmethod
+    def _stack_sum_or_zero(losses, device):
+        if len(losses) == 0:
+            return torch.tensor(0.0, device=device)
+        return torch.stack(losses).sum()
+
+    def _collect_moe_outputs(self):
+        patch_start = getattr(self.model, 'num_tokens', 1)
+        aux_losses = []
+        null_probs = []
+        top1_routing = []
+        domain_logits = []
+        token_features = []
+
+        for block in self.model.blocks:
+            block_aux = getattr(block, 'aux_loss', None)
+            if block_aux is not None:
+                aux_losses.append(block_aux)
+
+            block_null = getattr(block, 'null_prob', None)
+            if block_null is not None and block_null.shape[1] > patch_start:
+                null_probs.append(block_null[:, patch_start:])
+
+            block_top1 = getattr(block, 'top1_routing', None)
+            if block_top1 is not None and block_top1.shape[1] > patch_start:
+                top1_routing.append(block_top1[:, patch_start:])
+
+            block_domain = getattr(block, 'domain_logits', None)
+            if block_domain is not None and block_domain.shape[1] > patch_start:
+                domain_logits.append(block_domain[:, patch_start:, :])
+
+            block_features = getattr(block, 'token_features', None)
+            if block_features is not None and block_features.shape[1] > patch_start:
+                token_features.append(block_features[:, patch_start:, :])
+
+        return aux_losses, null_probs, top1_routing, domain_logits, token_features
+
+    def _compute_domain_losses(self, domain_logits, null_probs, token_features, domain_targets):
+        device = domain_targets.device
+        domain_cls_losses = []
+        spurious_losses = []
+        contrastive_losses = []
+        eps = 1e-6
+        contrastive_temp = max(float(self.hparams.get('null_moe_contrastive_temp', 0.1)), 1e-6)
+
+        for idx, logits in enumerate(domain_logits):
+            batch_size, num_tokens, num_domains = logits.shape
+            repeated_targets = domain_targets.view(batch_size, 1).expand(-1, num_tokens).reshape(-1)
+            domain_cls_losses.append(F.cross_entropy(logits.reshape(-1, num_domains), repeated_targets))
+
+            domain_conf = F.softmax(logits.detach(), dim=-1).max(dim=-1).values
+            if idx < len(null_probs):
+                spurious_losses.append((domain_conf * (1.0 - null_probs[idx])).mean())
+
+            if idx < len(token_features):
+                features = token_features[idx]
+                spurious_weights = domain_conf
+                invariant_weights = 1.0 - domain_conf
+
+                spurious_proto = (features * spurious_weights.unsqueeze(-1)).sum(dim=1) / (
+                    spurious_weights.sum(dim=1, keepdim=True) + eps
+                )
+                invariant_proto = (features * invariant_weights.unsqueeze(-1)).sum(dim=1) / (
+                    invariant_weights.sum(dim=1, keepdim=True) + eps
+                )
+
+                spurious_proto = F.normalize(spurious_proto, p=2, dim=-1)
+                invariant_proto = F.normalize(invariant_proto, p=2, dim=-1)
+                cosine_sim = (spurious_proto * invariant_proto).sum(dim=-1)
+                contrastive_losses.append(((cosine_sim + 1.0) * 0.5 / contrastive_temp).mean())
+
+        domain_cls_loss = self._stack_mean_or_zero(domain_cls_losses, device)
+        spurious_loss = self._stack_mean_or_zero(spurious_losses, device)
+        contrastive_loss = self._stack_mean_or_zero(contrastive_losses, device)
+        return domain_cls_loss, spurious_loss, contrastive_loss
+
+    def _compute_null_usage(self, null_probs, top1_routing, device):
+        zero = torch.tensor(0.0, device=device)
+        if len(null_probs) == 0:
+            return zero, zero, zero, zero, zero, zero, None
+
+        flat_null = torch.cat([null_tensor.reshape(-1) for null_tensor in null_probs], dim=0)
+        avg_null = flat_null.mean()
+        max_null = flat_null.max()
+        pct_over_50 = (flat_null > 0.5).float().mean()
+        pct_over_70 = (flat_null > 0.7).float().mean()
+        pct_over_90 = (flat_null > 0.9).float().mean()
+
+        null_top1_share = zero
+        top1_dist = None
+        if len(top1_routing):
+            flat_top1 = torch.cat([routing.reshape(-1).long() for routing in top1_routing], dim=0)
+            counts = torch.bincount(flat_top1, minlength=self.num_total_experts).float()
+            top1_dist = counts / counts.sum().clamp_min(1.0)
+            null_top1_share = top1_dist[-1]
+
+        return avg_null, max_null, pct_over_50, pct_over_70, pct_over_90, null_top1_share, top1_dist
+
+    def _maybe_print_null_diagnostics(
+            self,
+            avg_null,
+            max_null,
+            pct_over_50,
+            pct_over_70,
+            pct_over_90,
+            null_top1_share,
+            top1_dist,
+            null_cap_penalty):
+        interval = int(self.hparams.get('null_moe_diag_interval', 500))
+        if interval <= 0 or (self.update_count.item() % interval != 0):
+            return
+
+        dist_string = 'n/a'
+        if top1_dist is not None:
+            parts = []
+            for expert_idx in range(self.num_real_experts):
+                parts.append(f'e{expert_idx}:{top1_dist[expert_idx].item():.3f}')
+            parts.append(f'null:{top1_dist[-1].item():.3f}')
+            dist_string = ', '.join(parts)
+
+        print(
+            '[NullExpertMoE] step={} avg_null={:.4f} max_null={:.4f} '
+            'pct>0.5={:.3f} pct>0.7={:.3f} pct>0.9={:.3f} '
+            'null_top1={:.3f} null_cap_penalty={:.6f} top1_dist=[{}]'.format(
+                self.update_count.item(),
+                avg_null.item(),
+                max_null.item(),
+                pct_over_50.item(),
+                pct_over_70.item(),
+                pct_over_90.item(),
+                null_top1_share.item(),
+                null_cap_penalty.item(),
+                dist_string
+            )
+        )
+
+    def update(self, minibatches, unlabeled=None):
+        del unlabeled
+
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        domain_targets = torch.cat([
+            torch.full((x.shape[0],), env_idx, dtype=torch.long, device=x.device)
+            for env_idx, (x, _) in enumerate(minibatches)
+        ])
+
+        logits = self.predict(all_x)
+        ce_loss = F.cross_entropy(logits, all_y)
+
+        aux_losses, null_probs, top1_routing, domain_logits, token_features = self._collect_moe_outputs()
+        loss_aux = self._stack_sum_or_zero(aux_losses, all_x.device)
+        domain_cls_loss, spurious_loss, contrastive_loss = self._compute_domain_losses(
+            domain_logits,
+            null_probs,
+            token_features,
+            domain_targets
+        )
+
+        avg_null, max_null, pct_over_50, pct_over_70, pct_over_90, null_top1_share, top1_dist = self._compute_null_usage(
+            null_probs,
+            top1_routing,
+            all_x.device
+        )
+
+        null_cap = float(self.hparams.get('null_moe_max_null_ratio', 0.2))
+        null_cap_penalty = F.relu(avg_null - null_cap) ** 2
+
+        total_loss = (
+            ce_loss
+            + float(self.hparams.get('null_moe_balance_weight', 0.01)) * loss_aux
+            + float(self.hparams.get('null_moe_spurious_weight', 0.1)) * spurious_loss
+            + float(self.hparams.get('null_moe_contrastive_weight', 0.0)) * contrastive_loss
+            + float(self.hparams.get('null_moe_cap_weight', 1.0)) * null_cap_penalty
+            + float(self.hparams.get('null_moe_domain_weight', 1.0)) * domain_cls_loss
+        )
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        self.update_count += 1
+        self._maybe_print_null_diagnostics(
+            avg_null,
+            max_null,
+            pct_over_50,
+            pct_over_70,
+            pct_over_90,
+            null_top1_share,
+            top1_dist,
+            null_cap_penalty
+        )
+
+        return {
+            'loss': total_loss.item(),
+            'ce_loss': ce_loss.item(),
+            'loss_aux': loss_aux.item(),
+            'domain_cls_loss': domain_cls_loss.item(),
+            'spurious_loss': spurious_loss.item(),
+            'contrastive_loss': contrastive_loss.item(),
+            'null_cap_penalty': null_cap_penalty.item(),
+            'null_avg_prob': avg_null.item(),
+            'null_max_prob': max_null.item(),
+            'null_top1_share': null_top1_share.item(),
+        }
+
+    def predict(self, x, forward_feature=False):
+        if forward_feature:
+            return self.model.forward_features(x)
+        prediction = self.model(x)
+        if type(prediction) is tuple:
+            return (prediction[0] + prediction[1]) / 2
+        return prediction
 
 
 class Fish(Algorithm):

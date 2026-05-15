@@ -236,9 +236,135 @@ class Attention(nn.Module):
             return x
 
 
+class TokenRouterWithNull(nn.Module):
+    """Cosine router with an additional null expert."""
+
+    def __init__(self, num_real_experts, embed_dim, top_k=2, temperature=0.1):
+        super().__init__()
+        self.num_real_experts = num_real_experts
+        self.num_total_experts = num_real_experts + 1
+        self.top_k = max(1, min(top_k, self.num_total_experts))
+        self.temperature = temperature
+        self.expert_embeddings = nn.Parameter(torch.randn(self.num_total_experts, embed_dim))
+        nn.init.normal_(self.expert_embeddings, std=0.02)
+
+    def forward(self, x):
+        # x: [B, N, C]
+        x_flat = x.reshape(-1, x.shape[-1])
+        x_norm = F.normalize(x_flat, p=2, dim=-1)
+        e_norm = F.normalize(self.expert_embeddings, p=2, dim=-1)
+
+        logits = F.linear(x_norm, e_norm) / self.temperature
+        probs = F.softmax(logits, dim=-1)
+
+        topk_probs, topk_indices = torch.topk(probs, self.top_k, dim=-1)
+        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # Balance only over real experts so null cannot absorb load-balancing pressure.
+        importance_real = probs[:, :self.num_real_experts].sum(dim=0)
+        flat_indices = topk_indices.reshape(-1)
+        load_all = torch.bincount(flat_indices, minlength=self.num_total_experts).to(probs.dtype)
+        load_real = load_all[:self.num_real_experts]
+
+        loss_imp = (importance_real.std(unbiased=False) / (importance_real.mean() + 1e-10)) ** 2
+        loss_load = (load_real.std(unbiased=False) / (load_real.mean() + 1e-10)) ** 2
+        aux_loss = loss_imp + loss_load
+
+        null_prob = probs[:, -1]
+        top1_idx = topk_indices[:, 0]
+        return topk_probs, topk_indices, aux_loss, probs, null_prob, top1_idx
+
+
+class TokenMoEWithNull(nn.Module):
+    """Token-level MoE for ViT with one additional null expert."""
+
+    def __init__(
+            self,
+            in_features,
+            hidden_features,
+            num_experts,
+            top_k=2,
+            drop=0.0,
+            act_layer=nn.GELU,
+            num_domains=1,
+            temperature=0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.router = TokenRouterWithNull(num_experts, in_features, top_k=top_k, temperature=temperature)
+        self.experts = nn.ModuleList([
+            Mlp(in_features=in_features, hidden_features=hidden_features, act_layer=act_layer, drop=drop)
+            for _ in range(num_experts)
+        ])
+
+        hidden_dim = max(64, in_features // 2)
+        self.domain_classifier = None
+        if num_domains > 1:
+            self.domain_classifier = nn.Sequential(
+                nn.Linear(in_features, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(drop),
+                nn.Linear(hidden_dim, num_domains),
+            )
+
+        self.aux_loss = None
+        self.null_prob = None
+        self.top1_routing = None
+        self.domain_logits = None
+        self.token_features = None
+
+    def forward(self, x, domain_index=None):
+        del domain_index  # routing and auxiliary losses are token-driven
+
+        batch_size, seq_len, channels = x.shape
+        topk_probs, topk_indices, aux_loss, _, null_prob, top1_idx = self.router(x)
+        self.aux_loss = aux_loss
+        self.null_prob = null_prob.view(batch_size, seq_len)
+        self.top1_routing = top1_idx.view(batch_size, seq_len)
+        self.token_features = x
+
+        self.domain_logits = None
+        if self.domain_classifier is not None:
+            # Detach features so this term trains the token classifier without
+            # explicitly making the backbone more domain-specific.
+            self.domain_logits = self.domain_classifier(x.reshape(-1, channels).detach()).view(batch_size, seq_len, -1)
+
+        expert_outputs = [expert(x) for expert in self.experts]
+        weighted_outputs = []
+        for expert_idx, expert_out in enumerate(expert_outputs):
+            expert_mask = (topk_indices == expert_idx)
+            expert_weights = torch.where(
+                expert_mask,
+                topk_probs,
+                torch.zeros_like(topk_probs)
+            ).sum(dim=-1)
+            weighted_outputs.append(expert_out * expert_weights.view(batch_size, seq_len, 1))
+
+        if len(weighted_outputs) == 0:
+            return torch.zeros_like(x)
+        return torch.stack(weighted_outputs, dim=0).sum(dim=0)
+
+
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, router='cosine_top'):
+    def __init__(
+            self,
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            drop=0.,
+            attn_drop=0.,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+            cur_depth=0,
+            moe_layers=None,
+            num_experts=6,
+            router='cosine_top',
+            moe_top_k=1,
+            use_null_moe=False,
+            num_domains=1,
+            moe_temperature=0.1):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -246,38 +372,84 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.aux_loss = None
+        self.null_prob = None
+        self.top1_routing = None
+        self.domain_logits = None
+        self.token_features = None
         self.is_moe_layer = False
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.cur_layer = moe_layers[cur_depth] if moe_layers is not None else 'F'
         self.moe_drop = nn.Dropout(0.1)
+        self.use_null_moe = use_null_moe
         # self.is_tutel = is_tutel
         self.aux_loss_weights = 0.01
         if self.cur_layer == 'S':
-            # print(f'cur_layer {cur_depth} is sparse with {num_experts} experts with BPR True')
-            self.mlp = tutel_moe.moe_layer(
-                gate_type={'type': router, 'k': 1, 'fp32_gate': True, 'gate_noise': 1.0, 'capacity_factor': 1.5},
-                experts={'type': 'ffn', 'count_per_node': num_experts,
-                         'hidden_size_per_expert': mlp_hidden_dim,
-                         'activation_fn': lambda x: self.moe_drop(F.gelu(x))},
-                model_dim=dim,
-                batch_prioritized_routing=True,
-                is_gshard_loss=False,
-            )
+            if self.use_null_moe:
+                self.mlp = TokenMoEWithNull(
+                    in_features=dim,
+                    hidden_features=mlp_hidden_dim,
+                    num_experts=num_experts,
+                    top_k=moe_top_k,
+                    drop=drop,
+                    act_layer=act_layer,
+                    num_domains=num_domains,
+                    temperature=moe_temperature,
+                )
+            else:
+                if 'tutel_moe' not in globals():
+                    raise RuntimeError('Tutel MoE is required for sparse ViT blocks when null MoE is disabled.')
+                self.mlp = tutel_moe.moe_layer(
+                    gate_type={
+                        'type': router,
+                        'k': max(1, min(moe_top_k, num_experts)),
+                        'fp32_gate': True,
+                        'gate_noise': 1.0,
+                        'capacity_factor': 1.5
+                    },
+                    experts={
+                        'type': 'ffn',
+                        'count_per_node': num_experts,
+                        'hidden_size_per_expert': mlp_hidden_dim,
+                        'activation_fn': lambda t: self.moe_drop(F.gelu(t))
+                    },
+                    model_dim=dim,
+                    batch_prioritized_routing=True,
+                    is_gshard_loss=False,
+                )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, return_attention=False):
+    def forward(self, x, domain_index=None, return_attention=False):
         if return_attention:
             y, attn = self.attn(self.norm1(x), return_attention=True)
             return attn
+
         if self.cur_layer == 'S':
             x = x + self.drop_path(self.attn(self.norm1(x)))
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-            self.aux_loss = self.mlp.l_aux * self.aux_loss_weights
+            if self.use_null_moe:
+                moe_out = self.mlp(self.norm2(x), domain_index=domain_index)
+                self.aux_loss = self.mlp.aux_loss
+                self.null_prob = self.mlp.null_prob
+                self.top1_routing = self.mlp.top1_routing
+                self.domain_logits = self.mlp.domain_logits
+                self.token_features = self.mlp.token_features
+            else:
+                moe_out = self.mlp(self.norm2(x))
+                self.aux_loss = self.mlp.l_aux * self.aux_loss_weights
+                self.null_prob = None
+                self.top1_routing = None
+                self.domain_logits = None
+                self.token_features = None
+            x = x + self.drop_path(moe_out)
             return x
         elif self.cur_layer == 'F':
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
+            self.aux_loss = None
+            self.null_prob = None
+            self.top1_routing = None
+            self.domain_logits = None
+            self.token_features = None
             return x
         else:
             raise Exception
@@ -296,7 +468,8 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, index_hook=False, router='cosine_top'):
+                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, index_hook=False,
+                 router='cosine_top', moe_top_k=1, use_null_moe=False, num_domains=1, moe_temperature=0.1):
         """
         Args:
             img_size (int, tuple): input image size
@@ -337,7 +510,9 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, router=router)
+                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, router=router,
+                moe_top_k=moe_top_k, use_null_moe=use_null_moe, num_domains=num_domains,
+                moe_temperature=moe_temperature)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -409,7 +584,7 @@ class VisionTransformer(nn.Module):
             x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
         for blk in self.blocks:
-            x = blk(x, domain_index)
+            x = blk(x, domain_index=domain_index)
         x = self.norm(x)
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
@@ -551,12 +726,25 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
         block.attn.qkv.bias.copy_(torch.cat([_n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('query', 'key', 'value')]))
         block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
         block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
-        for r in range(2):
-            if hasattr(block.mlp, 'experts'):
+        if hasattr(block.mlp, 'experts') and hasattr(block.mlp.experts, 'fc1'):
+            for r in range(2):
                 num_experts = getattr(block.mlp, 'experts').fc1.shape[0]
                 for ind in range(num_experts):
-                    getattr(block.mlp.experts, f'fc{r + 1}')[ind].copy_(torch.from_numpy(w[f'{block_prefix}MlpBlock_3/Dense_{r}/kernel']))
-            else:
+                    getattr(block.mlp.experts, f'fc{r + 1}')[ind].copy_(
+                        torch.from_numpy(w[f'{block_prefix}MlpBlock_3/Dense_{r}/kernel'])
+                    )
+        elif hasattr(block.mlp, 'experts') and isinstance(block.mlp.experts, nn.ModuleList):
+            dense0_w = _n2p(w[f'{block_prefix}MlpBlock_3/Dense_0/kernel'])
+            dense0_b = _n2p(w[f'{block_prefix}MlpBlock_3/Dense_0/bias'])
+            dense1_w = _n2p(w[f'{block_prefix}MlpBlock_3/Dense_1/kernel'])
+            dense1_b = _n2p(w[f'{block_prefix}MlpBlock_3/Dense_1/bias'])
+            for expert in block.mlp.experts:
+                expert.fc1.weight.copy_(dense0_w)
+                expert.fc1.bias.copy_(dense0_b)
+                expert.fc2.weight.copy_(dense1_w)
+                expert.fc2.bias.copy_(dense1_b)
+        else:
+            for r in range(2):
                 getattr(block.mlp, f'fc{r + 1}').weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_3/Dense_{r}/kernel']))
                 getattr(block.mlp, f'fc{r + 1}').bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_3/Dense_{r}/bias']))
         block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/scale']))

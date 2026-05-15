@@ -44,6 +44,8 @@ if __name__ == "__main__":
     parser.add_argument('--drop_out', type=float, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--weight_decay', type=float, default=None)
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Override dataset DataLoader worker count.')
     parser.add_argument('--steps', type=int, default=None,
                         help='Number of steps. Default is dataset-dependent.')
     parser.add_argument('--checkpoint_freq', type=int, default=None,
@@ -123,6 +125,9 @@ if __name__ == "__main__":
                                                args.test_envs, hparams)
     else:
         raise NotImplementedError
+
+    if args.num_workers is not None:
+        dataset.N_WORKERS = args.num_workers
 
     # Split each env into an 'in-split' and an 'out-split'. We'll train on
     # each in-split except the test envs, and evaluate on all splits.

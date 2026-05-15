@@ -40,6 +40,8 @@ def _hparams(algorithm, dataset, random_seed):
     hparams["optimizer"] = ("adam", "adam")
     _hparam('vit_finetune', True, lambda r: True)
     _hparam('vit_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
+    _hparam('gmoe_num_experts', 6, lambda r: int(r.choice([4, 6, 8])))
+    _hparam('gmoe_top_k', 2, lambda r: int(r.choice([1, 2])))
     hparams["val_augment"] = (False, False)  # augmentation for in-domain validation set
     hparams["freeze_bn"] = (True, True)
     hparams["pretrained"] = (True, True)  # only for ResNet
@@ -134,6 +136,17 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('is_project', False, lambda r: False)
         _hparam('is_flipped', True, lambda r: True)
 
+    elif algorithm == 'NullExpertMoE':
+        _hparam('null_moe_balance_weight', 0.01, lambda r: 10 ** r.uniform(-3, -1))
+        _hparam('null_moe_spurious_weight', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('null_moe_contrastive_weight', 0.0, lambda r: r.choice([0.0, 0.01, 0.1]))
+        _hparam('null_moe_contrastive_temp', 0.1, lambda r: r.choice([0.05, 0.1, 0.2]))
+        _hparam('null_moe_temperature', 0.1, lambda r: r.choice([0.05, 0.1, 0.2]))
+        _hparam('null_moe_max_null_ratio', 0.2, lambda r: r.choice([0.1, 0.2, 0.3]))
+        _hparam('null_moe_cap_weight', 1.0, lambda r: 10 ** r.uniform(-1, 1))
+        _hparam('null_moe_domain_weight', 1.0, lambda r: 10 ** r.uniform(-1, 1))
+        _hparam('null_moe_diag_interval', 500, lambda r: 500)
+
     # Dataset-and-algorithm-specific hparam definitions. Each block of code
     # below corresponds to exactly one hparam. Avoid nested conditionals.
 
@@ -171,7 +184,7 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm in ['DANN', 'CDANN']:
         _hparam('weight_decay_g', 0., lambda r: 10 ** r.uniform(-6, -2))
 
-    if 'GMOE' in algorithm:
+    if 'GMOE' in algorithm or algorithm == 'NullExpertMoE':
         if dataset == 'VLCS':
             _hparam('lr', 3e-5, lambda r: 10 ** r.uniform(-4.5, -2.5))
             _hparam('resnet_dropout', 0.5, lambda r: r.choice([0., 0.1, 0.5]))
