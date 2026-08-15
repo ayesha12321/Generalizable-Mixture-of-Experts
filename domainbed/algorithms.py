@@ -316,6 +316,9 @@ class NullExpertMoE(Algorithm):
         domain_cls_losses = []
         spurious_losses = []
         contrastive_losses = []
+        adaptive_cap_losses = []
+        centered_cap_losses = []
+        domain_conf_means = []
         eps = 1e-6
         contrastive_temp = max(float(self.hparams.get('null_moe_contrastive_temp', 0.1)), 1e-6)
 
@@ -325,8 +328,17 @@ class NullExpertMoE(Algorithm):
             domain_cls_losses.append(F.cross_entropy(logits.reshape(-1, num_domains), repeated_targets))
 
             domain_conf = F.softmax(logits.detach(), dim=-1).max(dim=-1).values
+            domain_conf_means.append(domain_conf.mean())
             if idx < len(null_probs):
                 spurious_losses.append((domain_conf * (1.0 - null_probs[idx])).mean())
+                adaptive_cap_losses.append((null_probs[idx] * (1.0 - domain_conf)).mean())
+                # Standardized spuriousness: zero-mean so the net push on average
+                # null usage is 0 (cannot run away), unit-scale so the force does
+                # not decay as the domain classifier saturates. Minimizing this
+                # raises the correlation between spuriousness and null routing:
+                # tokens above average get pushed toward null, those below away.
+                centered = (domain_conf - domain_conf.mean()) / (domain_conf.std() + eps)
+                centered_cap_losses.append(-(centered * null_probs[idx]).mean())
 
             if idx < len(token_features):
                 features = token_features[idx]
@@ -348,7 +360,11 @@ class NullExpertMoE(Algorithm):
         domain_cls_loss = self._stack_mean_or_zero(domain_cls_losses, device)
         spurious_loss = self._stack_mean_or_zero(spurious_losses, device)
         contrastive_loss = self._stack_mean_or_zero(contrastive_losses, device)
-        return domain_cls_loss, spurious_loss, contrastive_loss
+        adaptive_cap_loss = self._stack_mean_or_zero(adaptive_cap_losses, device)
+        centered_cap_loss = self._stack_mean_or_zero(centered_cap_losses, device)
+        mean_domain_conf = self._stack_mean_or_zero(domain_conf_means, device)
+        return (domain_cls_loss, spurious_loss, contrastive_loss,
+                adaptive_cap_loss, centered_cap_loss, mean_domain_conf)
 
     def _compute_null_usage(self, null_probs, top1_routing, device):
         zero = torch.tensor(0.0, device=device)
@@ -372,6 +388,47 @@ class NullExpertMoE(Algorithm):
 
         return avg_null, max_null, pct_over_50, pct_over_70, pct_over_90, null_top1_share, top1_dist
 
+    @torch.no_grad()
+    def _compute_signal_diagnostics(self, domain_logits, null_probs):
+        """Is domain_conf a usable *per-token* spuriousness signal, or just a
+        per-image style property? Decomposes its variance into within-image
+        (tokens of one image differ) vs between-image (images differ), and
+        checks whether the router actually correlates null routing with it.
+        Diagnostic only -- no gradients, called on diag steps.
+        """
+        if len(domain_logits) == 0 or len(null_probs) == 0:
+            return None
+
+        conf = torch.cat([
+            F.softmax(logits, dim=-1).max(dim=-1).values
+            for logits in domain_logits
+        ], dim=0)                                    # [B*blocks, N]
+        null = torch.cat([n for n in null_probs], dim=0)
+        if conf.shape != null.shape:
+            return None
+
+        flat_conf, flat_null = conf.reshape(-1), null.reshape(-1)
+        # Variance decomposition: does spuriousness vary *inside* an image?
+        within_img = conf.std(dim=1).mean()           # spread across tokens of one image
+        between_img = conf.mean(dim=1).std()          # spread across images
+
+        cf = flat_conf - flat_conf.mean()
+        nl = flat_null - flat_null.mean()
+        denom = (cf.norm() * nl.norm()).clamp_min(1e-8)
+        corr = (cf * nl).sum() / denom                # does router follow the signal?
+
+        q = torch.tensor([0.10, 0.50, 0.90], device=flat_conf.device)
+        c10, c50, c90 = torch.quantile(flat_conf, q).tolist()
+        n10, n50, n90 = torch.quantile(flat_null, q).tolist()
+
+        return {
+            'conf_mean': flat_conf.mean().item(), 'conf_std': flat_conf.std().item(),
+            'conf_p10': c10, 'conf_p50': c50, 'conf_p90': c90,
+            'within_img_std': within_img.item(), 'between_img_std': between_img.item(),
+            'null_p10': n10, 'null_p50': n50, 'null_p90': n90,
+            'corr_conf_null': corr.item(),
+        }
+
     def _maybe_print_null_diagnostics(
             self,
             avg_null,
@@ -381,7 +438,12 @@ class NullExpertMoE(Algorithm):
             pct_over_90,
             null_top1_share,
             top1_dist,
-            null_cap_penalty):
+            null_cap_penalty,
+            adaptive_cap_loss,
+            mean_domain_conf,
+            centered_cap_loss=None,
+            guard_penalty=None,
+            signal_diag=None):
         interval = int(self.hparams.get('null_moe_diag_interval', 500))
         if interval <= 0 or (self.update_count.item() % interval != 0):
             return
@@ -395,10 +457,13 @@ class NullExpertMoE(Algorithm):
             dist_string = ', '.join(parts)
 
         print(
-            '[NullExpertMoE] step={} avg_null={:.4f} max_null={:.4f} '
+            '[NullExpertMoE] step={} cap_mode={} avg_null={:.4f} max_null={:.4f} '
             'pct>0.5={:.3f} pct>0.7={:.3f} pct>0.9={:.3f} '
-            'null_top1={:.3f} null_cap_penalty={:.6f} top1_dist=[{}]'.format(
+            'null_top1={:.3f} null_cap_penalty={:.6f} '
+            'adaptive_cap={:.6f} centered_cap={:.6f} guard={:.6f} '
+            'mean_domain_conf={:.4f} top1_dist=[{}]'.format(
                 self.update_count.item(),
+                str(self.hparams.get('null_moe_cap_mode', 'adaptive')),
                 avg_null.item(),
                 max_null.item(),
                 pct_over_50.item(),
@@ -406,9 +471,32 @@ class NullExpertMoE(Algorithm):
                 pct_over_90.item(),
                 null_top1_share.item(),
                 null_cap_penalty.item(),
+                adaptive_cap_loss.item(),
+                centered_cap_loss.item() if centered_cap_loss is not None else float('nan'),
+                guard_penalty.item() if guard_penalty is not None else float('nan'),
+                mean_domain_conf.item(),
                 dist_string
             )
         )
+
+        if signal_diag is not None:
+            d = signal_diag
+            # within_img_std is the decisive number: if it is ~0, domain_conf is a
+            # per-image style property and cannot discriminate tokens within an image.
+            print(
+                '[NullExpertMoE/signal] step={} conf_mean={:.4f} conf_std={:.4f} '
+                'conf_p10/50/90={:.3f}/{:.3f}/{:.3f} '
+                'within_img_std={:.4f} between_img_std={:.4f} within/between={:.2f} '
+                'null_p10/50/90={:.3f}/{:.3f}/{:.3f} corr(conf,null)={:+.4f}'.format(
+                    self.update_count.item(),
+                    d['conf_mean'], d['conf_std'],
+                    d['conf_p10'], d['conf_p50'], d['conf_p90'],
+                    d['within_img_std'], d['between_img_std'],
+                    d['within_img_std'] / max(d['between_img_std'], 1e-8),
+                    d['null_p10'], d['null_p50'], d['null_p90'],
+                    d['corr_conf_null'],
+                )
+            )
 
     def update(self, minibatches, unlabeled=None):
         del unlabeled
@@ -425,7 +513,8 @@ class NullExpertMoE(Algorithm):
 
         aux_losses, null_probs, top1_routing, domain_logits, token_features = self._collect_moe_outputs()
         loss_aux = self._stack_sum_or_zero(aux_losses, all_x.device)
-        domain_cls_loss, spurious_loss, contrastive_loss = self._compute_domain_losses(
+        (domain_cls_loss, spurious_loss, contrastive_loss,
+         adaptive_cap_loss, centered_cap_loss, mean_domain_conf) = self._compute_domain_losses(
             domain_logits,
             null_probs,
             token_features,
@@ -438,15 +527,41 @@ class NullExpertMoE(Algorithm):
             all_x.device
         )
 
-        null_cap = float(self.hparams.get('null_moe_max_null_ratio', 0.2))
-        null_cap_penalty = F.relu(avg_null - null_cap) ** 2
+        cap_mode = str(self.hparams.get('null_moe_cap_mode', 'centered'))
+        spurious_weight = float(self.hparams.get('null_moe_spurious_weight', 0.1))
+        guard_penalty = torch.tensor(0.0, device=all_x.device)
+        guard_weight = float(self.hparams.get('null_moe_cap_weight', 1.0))
+
+        if cap_mode == 'fixed':
+            null_cap = float(self.hparams.get('null_moe_max_null_ratio', 0.2))
+            null_cap_penalty = F.relu(avg_null - null_cap) ** 2
+            cap_weight = guard_weight
+        elif cap_mode == 'adaptive':
+            # Content-aware cap: only penalize null routing on tokens the domain
+            # classifier does not consider spurious, so genuinely spurious tokens
+            # can reach the null expert for free.
+            null_cap_penalty = adaptive_cap_loss
+            cap_weight = float(self.hparams.get('null_moe_adaptive_cap_weight', 0.1))
+        else:
+            # Standardized signal decides which tokens go null. It subsumes
+            # spurious_loss -- that term is a one-way push toward null with no
+            # counterforce, so keeping both would reintroduce the runaway it
+            # caused in 'adaptive' mode. Dropped here deliberately.
+            null_cap_penalty = centered_cap_loss
+            cap_weight = float(self.hparams.get('null_moe_centered_weight', 0.1))
+            spurious_weight = 0.0
+            # Dormant guardrail: sits far above normal usage so it never shapes
+            # allocation, but prevents a pathological collapse to ~all-null.
+            guard_ratio = float(self.hparams.get('null_moe_guard_ratio', 0.35))
+            guard_penalty = F.relu(avg_null - guard_ratio) ** 2
 
         total_loss = (
             ce_loss
             + float(self.hparams.get('null_moe_balance_weight', 0.01)) * loss_aux
-            + float(self.hparams.get('null_moe_spurious_weight', 0.1)) * spurious_loss
+            + spurious_weight * spurious_loss
             + float(self.hparams.get('null_moe_contrastive_weight', 0.0)) * contrastive_loss
-            + float(self.hparams.get('null_moe_cap_weight', 1.0)) * null_cap_penalty
+            + cap_weight * null_cap_penalty
+            + guard_weight * guard_penalty
             + float(self.hparams.get('null_moe_domain_weight', 1.0)) * domain_cls_loss
         )
 
@@ -455,6 +570,10 @@ class NullExpertMoE(Algorithm):
         self.optimizer.step()
 
         self.update_count += 1
+        diag_interval = int(self.hparams.get('null_moe_diag_interval', 500))
+        signal_diag = None
+        if diag_interval > 0 and self.update_count.item() % diag_interval == 0:
+            signal_diag = self._compute_signal_diagnostics(domain_logits, null_probs)
         self._maybe_print_null_diagnostics(
             avg_null,
             max_null,
@@ -463,7 +582,12 @@ class NullExpertMoE(Algorithm):
             pct_over_90,
             null_top1_share,
             top1_dist,
-            null_cap_penalty
+            null_cap_penalty,
+            adaptive_cap_loss,
+            mean_domain_conf,
+            centered_cap_loss,
+            guard_penalty,
+            signal_diag
         )
 
         return {
@@ -474,6 +598,10 @@ class NullExpertMoE(Algorithm):
             'spurious_loss': spurious_loss.item(),
             'contrastive_loss': contrastive_loss.item(),
             'null_cap_penalty': null_cap_penalty.item(),
+            'adaptive_cap_loss': adaptive_cap_loss.item(),
+            'centered_cap_loss': centered_cap_loss.item(),
+            'guard_penalty': guard_penalty.item(),
+            'mean_domain_conf': mean_domain_conf.item(),
             'null_avg_prob': avg_null.item(),
             'null_max_prob': max_null.item(),
             'null_top1_share': null_top1_share.item(),

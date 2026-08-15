@@ -17,6 +17,9 @@ import numpy as np
 import torch
 import torch.utils.data
 import torchvision
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from domainbed import algorithms
 from domainbed import datasets

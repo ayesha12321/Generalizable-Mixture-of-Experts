@@ -1,0 +1,8 @@
+CLAUDE.md
+domainbed/__pycache__/__init__.cpython-314.pyc
+domainbed/__pycache__/algorithms.cpython-314.pyc
+domainbed/__pycache__/hparams_registry.cpython-314.pyc
+domainbed/__pycache__/vit_helpers.cpython-314.pyc
+domainbed/lib/__pycache__/__init__.cpython-314.pyc
+domainbed/lib/__pycache__/misc.cpython-314.pyc
+domainbed/scripts/__pycache__/train.cpython-314.pyc

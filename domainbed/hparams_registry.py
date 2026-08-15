@@ -144,6 +144,10 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('null_moe_temperature', 0.1, lambda r: r.choice([0.05, 0.1, 0.2]))
         _hparam('null_moe_max_null_ratio', 0.2, lambda r: r.choice([0.1, 0.2, 0.3]))
         _hparam('null_moe_cap_weight', 1.0, lambda r: 10 ** r.uniform(-1, 1))
+        _hparam('null_moe_cap_mode', 'centered', lambda r: r.choice(['fixed', 'adaptive', 'centered']))
+        _hparam('null_moe_adaptive_cap_weight', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('null_moe_centered_weight', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('null_moe_guard_ratio', 0.35, lambda r: r.choice([0.3, 0.35, 0.4]))
         _hparam('null_moe_domain_weight', 1.0, lambda r: 10 ** r.uniform(-1, 1))
         _hparam('null_moe_diag_interval', 500, lambda r: 500)
 

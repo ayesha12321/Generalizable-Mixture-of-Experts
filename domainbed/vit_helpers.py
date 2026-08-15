@@ -333,6 +333,21 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                     vit_mlp_bias = state_dict[f'blocks.{i}.mlp.fc{r}.bias']
                     stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, hidden_dim)
                     state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
+            elif isinstance(block.mlp.experts, nn.ModuleList):
+                # NullExpertMoE's TokenMoEWithNull: per-expert Mlp submodules
+                # (not Tutel's batched format). Warm-start each real expert as
+                # a copy of the pretrained dense FFN, matching what the Tutel
+                # branch above already does for GMoE.
+                num_experts = len(block.mlp.experts)
+                fc1_w = state_dict[f'blocks.{i}.mlp.fc1.weight']
+                fc1_b = state_dict[f'blocks.{i}.mlp.fc1.bias']
+                fc2_w = state_dict[f'blocks.{i}.mlp.fc2.weight']
+                fc2_b = state_dict[f'blocks.{i}.mlp.fc2.bias']
+                for e in range(num_experts):
+                    state_dict[f'blocks.{i}.mlp.experts.{e}.fc1.weight'] = fc1_w
+                    state_dict[f'blocks.{i}.mlp.experts.{e}.fc1.bias'] = fc1_b
+                    state_dict[f'blocks.{i}.mlp.experts.{e}.fc2.weight'] = fc2_w
+                    state_dict[f'blocks.{i}.mlp.experts.{e}.fc2.bias'] = fc2_b
 
     key_list = list(state_dict.keys())
     for item in removed_index:
